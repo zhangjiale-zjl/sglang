@@ -10,6 +10,7 @@ It follows the same HiCacheStorage contract and key layout strategy, while using
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 import json
 import logging
 import time
@@ -340,14 +341,20 @@ class NpuMemcacheStore(HiCacheStorage):
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
         assert self.mem_pool_host.layout in [
+            "layer_first",
             "page_first",
             "page_first_direct",
             "page_head",
             "page_first_kv_split",
         ], (
-            "npu_memcache storage backend only support page_first, page_first_direct, "
-            "page_head and page_first_kv_split layout"
+            "npu_memcache storage backend only supports layer_first, page_first, "
+            "page_first_direct, page_head and page_first_kv_split layouts"
         )
+        if self.mem_pool_host.layout == "layer_first" and not self.is_mla_backend:
+            raise ValueError(
+                "npu_memcache layer_first multi-buffer is only supported for MLA "
+                "host KV pool. Use page_first/page_first_direct for MHA."
+            )
         try:
             self.register_buffer(self.mem_pool_host.kv_buffer)
             if self._mla_uses_kv_split():
@@ -544,6 +551,10 @@ class NpuMemcacheStore(HiCacheStorage):
                 keys, transfer
             )
             key_strs = self._tag_keys(key_strs)
+            if len(ptr_list) != len(key_strs):
+                ptr_list, element_size_list = self._pack_multi_buffer_meta(
+                    key_strs, ptr_list, element_size_list
+                )
 
             if is_set:
                 exist_result = self._batch_exist(key_strs)
@@ -601,8 +612,29 @@ class NpuMemcacheStore(HiCacheStorage):
         for key_ in keys:
             key_list.append(f"{key_}_{self.mha_suffix}_k")
             key_list.append(f"{key_}_{self.mha_suffix}_v")
-        assert len(key_list) == len(ptr_list)
+        if len(key_list) != len(ptr_list):
+            raise RuntimeError(
+                "npu_memcache layer_first multi-buffer is only supported for MLA "
+                "host KV pool. Use page_first/page_first_direct for MHA."
+            )
         return key_list, ptr_list, element_size_list
+
+    @staticmethod
+    def _pack_multi_buffer_meta(key_strs, ptr_list, element_size_list):
+        assert len(key_strs) > 0
+        assert len(ptr_list) == len(element_size_list)
+        assert len(ptr_list) % len(key_strs) == 0
+        buffers_per_key = len(ptr_list) // len(key_strs)
+        return (
+            [
+                ptr_list[i : i + buffers_per_key]
+                for i in range(0, len(ptr_list), buffers_per_key)
+            ],
+            [
+                element_size_list[i : i + buffers_per_key]
+                for i in range(0, len(element_size_list), buffers_per_key)
+            ],
+        )
 
     def _get_mla_buffer_meta(self, keys, indices):
         ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(indices)
@@ -616,6 +648,10 @@ class NpuMemcacheStore(HiCacheStorage):
                     key_list.append(f"{key_}_{self.mla_suffix}_index_k")
                 if self._mla_has_index_scale():
                     key_list.append(f"{key_}_{self.mla_suffix}_scale")
+        if len(key_list) != len(ptr_list):
+            ptr_list, element_size_list = self._pack_multi_buffer_meta(
+                key_list, ptr_list, element_size_list
+            )
         assert len(key_list) == len(ptr_list)
         return key_list, ptr_list, element_size_list
 
@@ -910,21 +946,29 @@ class NpuMemcacheStore(HiCacheStorage):
         self.store = None
 
     def _put_batch_zero_copy_impl(
-        self, key_strs: List[str], buffer_ptrs: List[int], buffer_sizes: List[int]
+        self, key_strs: List[str], buffer_ptrs: List[Any], buffer_sizes: List[Any]
     ) -> List[int]:
+        if buffer_ptrs and isinstance(buffer_ptrs[0], Sequence):
+            return self.store.batch_put_from_layers(
+                key_strs, buffer_ptrs, buffer_sizes
+            )
         return self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
 
     def _get_batch_zero_copy_impl(
-        self, key_strs: List[str], buffer_ptrs: List[int], buffer_sizes: List[int]
+        self, key_strs: List[str], buffer_ptrs: List[Any], buffer_sizes: List[Any]
     ) -> List[int]:
-        raw = self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
-        # memcache_hybrid reports 0 on success, but HiCache read postprocess expects
-        # positive values for success and negative values for failures.
+        multi_buffer = bool(buffer_ptrs) and isinstance(buffer_ptrs[0], Sequence)
+        if multi_buffer:
+            raw = self.store.batch_get_into_layers(
+                key_strs, buffer_ptrs, buffer_sizes
+            )
+        else:
+            raw = self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
         out: List[int] = []
         for code, sz in zip(raw, buffer_sizes):
             code = int(code)
             if code == 0:
-                out.append(int(sz))
+                out.append(sum(sz) if multi_buffer else int(sz))
             else:
                 out.append(-abs(code))
         return out
