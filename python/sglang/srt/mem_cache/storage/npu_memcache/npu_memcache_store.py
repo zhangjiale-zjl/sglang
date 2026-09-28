@@ -340,6 +340,12 @@ class NpuMemcacheStore(HiCacheStorage):
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
+        if getattr(mem_pool_host, "kv_buffer", None) is None:
+            # V4 的主 KV pool 是逻辑锚点；实体 buffer 由后续 v2 pool 注册。
+            self.gb_per_page = 0
+            if envs.SGLANG_NPU_MEMCACHE_ENABLE_WARMUP.get():
+                self.warmup()
+            return
         assert self.mem_pool_host.layout in [
             "layer_first",
             "page_first",
@@ -386,11 +392,18 @@ class NpuMemcacheStore(HiCacheStorage):
         # the corresponding host pool implementation at runtime.
         self.registered_pools[host_pool_name] = host_pool
 
-        # Hybrid pools expose the tensors that memcache requires for zero-copy I/O.
-        # The storage backend only depends on this accessor, not concrete fields.
-        buf_list = host_pool.get_hybrid_pool_buffer()
-        for buf in buf_list:
-            self.register_buffer(buf)
+        # 分层 pool 暴露多块 tensor；普通 draft pool 则使用 kv_buffer。
+        get_buffers = getattr(host_pool, "get_hybrid_pool_buffer", None)
+        buffers = (
+            get_buffers()
+            if get_buffers is not None
+            else [getattr(host_pool, "kv_buffer", None)]
+        )
+        if isinstance(buffers, torch.Tensor):
+            buffers = [buffers]
+        for buf in buffers:
+            if buf is not None:
+                self.register_buffer(buf)
 
     def _tag_keys(self, keys: List[str]) -> List[str]:
         if self.extra_backend_tag is None:
@@ -439,35 +452,71 @@ class NpuMemcacheStore(HiCacheStorage):
     def _get_hybrid_page_component_keys(
         self, page_keys: List[str], transfer: PoolTransfer
     ) -> Tuple[List[str], int]:
-        # A logical "page" may map to multiple physical objects in storage.
-        # - INDEXER: one key per page
-        # - MAMBA  : one temporal key + N conv keys per page (temporal is dropped
-        #             for conv-only models, mirroring get_page_buffer_meta)
-        # - DRAFT  : one k + one v key per page
-        # key_multiplier records how many component keys are generated per page.
+        # 后缀顺序必须与 host_pool.get_page_buffer_meta 的页内指针顺序一致。
         name = transfer.name
+        host_pool = self.registered_pools.get(name)
+        if host_pool is None:
+            raise ValueError(f"Unregistered MemCache hybrid pool: {name}")
         suffixes = []
         if name == PoolName.INDEXER:
             suffixes = [f"_{self.mla_suffix}_{PoolName.INDEXER}"]
         elif name == PoolName.MAMBA:
-            mamba_pool = getattr(self, "registered_pools", {}).get(PoolName.MAMBA)
-            conv_num = len(getattr(mamba_pool, "conv_buffer", None) or [])
+            conv_num = len(getattr(host_pool, "conv_buffer", None) or [])
             base_suffix = f"_{self.mha_suffix}"
-            # Must stay aligned with MambaPoolHost.get_page_buffer_meta(): it
-            # drops the temporal pointer when there is no SSM state, so the
-            # temporal key must be dropped under the same condition.
-            if getattr(mamba_pool, "temporal_state_elem_size", 1) > 0:
+            if getattr(host_pool, "temporal_state_elem_size", 1) > 0:
                 suffixes = [f"{base_suffix}_temporal"]
             suffixes += [f"{base_suffix}_conv_{i}" for i in range(conv_num)]
         elif name == PoolName.DRAFT:
-            # MHA draft KV: one k key + one v key per page, matching the
-            # (k_ptr, v_ptr) order of get_page_buffer_meta.
-            base_suffix = f"_{self.mha_suffix}"
-            suffixes = [f"{base_suffix}_k", f"{base_suffix}_v"]
-        else:
-            raise ValueError(f"Unsupported hybrid pool for batch v2 I/O: {name}")
+            from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+
+            if isinstance(host_pool, MLATokenToKVPoolHost):
+                suffixes = [f"_{self.mla_suffix}_{name}_k"]
+            else:
+                suffixes = [
+                    f"_{self.mha_suffix}_{name}_k",
+                    f"_{self.mha_suffix}_{name}_v",
+                ]
+        elif name == PoolName.DRAFT_SWA:
+            from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
+            from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+            from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+
+            if isinstance(host_pool, (DeepSeekV4PagedHostPool, MLATokenToKVPoolHost)):
+                suffixes = [f"_{self.mla_suffix}_{name}"]
+            elif isinstance(host_pool, MHATokenToKVPoolHost):
+                suffixes = [
+                    f"_{self.mha_suffix}_{name}_k",
+                    f"_{self.mha_suffix}_{name}_v",
+                ]
+        elif name in (
+            PoolName.DRAFT_INDEXER,
+            PoolName.DEEPSEEK_V4_C1,
+            PoolName.DEEPSEEK_V4_C1_INDEXER,
+            PoolName.DEEPSEEK_V4_C1_INDEXER_SCALE,
+            PoolName.DEEPSEEK_V4_C2,
+            PoolName.DEEPSEEK_V4_C2_INDEXER,
+            PoolName.DEEPSEEK_V4_C2_INDEXER_SCALE,
+            PoolName.DEEPSEEK_V4_C4,
+            PoolName.DEEPSEEK_V4_C4_ROPE,
+            PoolName.DEEPSEEK_V4_C4_INDEXER,
+            PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE,
+            PoolName.DEEPSEEK_V4_C128,
+            PoolName.DEEPSEEK_V4_C128_ROPE,
+            PoolName.DEEPSEEK_V4_C4_STATE,
+            PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
+            PoolName.DEEPSEEK_V4_C128_STATE,
+        ):
+            suffixes = [f"_{self.mla_suffix}_{name}"]
+        elif name == PoolName.SWA:
+            if not self.is_mla_backend and hasattr(host_pool, "v_buffer"):
+                suffixes = [
+                    f"_{self.mha_suffix}_{name}_k",
+                    f"_{self.mha_suffix}_{name}_v",
+                ]
+            elif self.is_mla_backend:
+                suffixes = [f"_{self.mla_suffix}_{name}"]
         if not suffixes:
-            raise ValueError(f"No storage component keys for hybrid pool: {name}")
+            raise ValueError(f"Unsupported MemCache hybrid pool: {name}")
         key_multiplier = len(suffixes)
         component_keys = [
             f"{page_key}{suffix}" for page_key in page_keys for suffix in suffixes
@@ -480,29 +529,39 @@ class NpuMemcacheStore(HiCacheStorage):
         pool_transfers: Optional[List[PoolTransfer]] = None,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> PoolTransferResult:
-        qkeys = self._tag_keys(keys)
-        kv_pages = self.batch_exists(keys, extra_info)
+        logical_anchor = getattr(self.mem_pool_host, "kv_buffer", None) is None
+        if logical_anchor and not pool_transfers:
+            # 没有可校验的实体 pool 时，不得把逻辑锚点当成 L3 命中。
+            return PoolTransferResult.empty()
+        kv_pages = (
+            len(keys)
+            if logical_anchor
+            else self.batch_exists(keys, extra_info)
+        )
 
         hit_count: dict = {PoolName.KV: kv_pages} if kv_pages else {}
-        final_pages = kv_pages
+        # 尾部窗口型 pool 可能只允许部分停止点，不能仅取各 pool 最大命中值。
+        restorable = list(range(1, kv_pages + 1))
 
         for transfer in pool_transfers or []:
-            if final_pages == 0:
+            if not restorable:
                 break
             component_keys, key_multiplier = self._get_hybrid_page_component_keys(
-                qkeys, transfer
+                keys, transfer
             )
-            ex = self._batch_exist(component_keys)
+            ex = self._batch_exist(self._tag_keys(component_keys))
             page_exists = [
                 all(r == 1 for r in ex[i * key_multiplier : (i + 1) * key_multiplier])
                 for i in range(kv_pages)
             ]
             boundary = 0
+            pool_restorable = []
             if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
                 try:
                     boundary = page_exists.index(False)
                 except ValueError:
                     boundary = kv_pages
+                pool_restorable = list(range(1, boundary + 1))
             elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
                 trailing = max(1, len(transfer.keys) if transfer.keys else 1)
                 for prefix_len in range(kv_pages, 0, -1):
@@ -510,13 +569,19 @@ class NpuMemcacheStore(HiCacheStorage):
                         page_exists[i]
                         for i in range(max(0, prefix_len - trailing), prefix_len)
                     ):
-                        boundary = prefix_len
-                        break
+                        pool_restorable.append(prefix_len)
+                        if boundary == 0:
+                            boundary = prefix_len
+            else:
+                raise ValueError(f"Unsupported pool hit policy: {transfer.hit_policy}")
             if boundary:
                 hit_count[transfer.name] = boundary
-            final_pages = min(final_pages, boundary)
+            pool_restorable_set = set(pool_restorable)
+            restorable = [p for p in restorable if p in pool_restorable_set]
 
-        return PoolTransferResult(final_pages, hit_count)
+        return PoolTransferResult(
+            restorable[-1] if restorable else 0, hit_count, restorable
+        )
 
     def _batch_io_v2(self, transfers: List[PoolTransfer], is_set: bool):
         # Unified v2 I/O path: each PoolTransfer can expand to one or more
@@ -705,7 +770,8 @@ class NpuMemcacheStore(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
-        # Apply extra_backend_tag prefix if available
+        if getattr(self.mem_pool_host, "kv_buffer", None) is None:
+            return [True] * len(keys)
         keys = self._tag_keys(keys)
 
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
@@ -730,7 +796,8 @@ class NpuMemcacheStore(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
-        # Apply extra_backend_tag prefix if available
+        if getattr(self.mem_pool_host, "kv_buffer", None) is None:
+            return [True] * len(keys)
         page_keys = self._tag_keys(keys)
 
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(
@@ -899,6 +966,9 @@ class NpuMemcacheStore(HiCacheStorage):
     def batch_exists(
         self, keys: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None
     ) -> int:
+        if getattr(self.mem_pool_host, "kv_buffer", None) is None:
+            # 单独查询没有实体 KV 数据；V4 必须走 v2 校验 side pools。
+            return 0
         page_keys = self._tag_keys(keys)
 
         if self.is_mla_backend:
