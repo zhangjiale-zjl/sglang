@@ -100,10 +100,12 @@ class PoolHitPolicy(str, Enum):
 
     ALL_PAGES      : every page in [0, kv_hit) must exist (e.g. DSA).
     TRAILING_PAGES : only the last N pages must exist (e.g. Mamba/SWA states).
+    GROUPED_PAGES  : every complete group endpoint must exist (e.g. NPU C128).
     """
 
     ALL_PAGES = "all_pages"
     TRAILING_PAGES = "trailing_pages"
+    GROUPED_PAGES = "grouped_pages"
 
 
 @dataclass
@@ -120,6 +122,8 @@ class PoolTransfer:
     device_indices: Optional[torch.Tensor] = None
     keys: Optional[List[str]] = None
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
+    # Number of primary KV pages represented by one independently indexed page.
+    group_pages: int = 1
     nodes_to_load: Optional[List[Any]] = None
     indices_from_pool: Optional[PoolName] = None
     # Full IDs backing a dependent device allocation: resident tensors or

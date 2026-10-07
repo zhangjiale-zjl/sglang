@@ -10,11 +10,12 @@ It follows the same HiCacheStorage contract and key layout strategy, while using
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 import json
 import logging
+import os
 import time
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple
 
@@ -183,6 +184,7 @@ class NpuMemcacheStore(HiCacheStorage):
                 logger.warning(
                     "Ignoring unknown Memcache LocalConfig keys: %s", unknown_fields
                 )
+            self._memcache_protocol = str(local_cfg.protocol)
 
             self.store = DistributedObjectStore()
             if self.store.setup(local_cfg) != 0:
@@ -193,6 +195,13 @@ class NpuMemcacheStore(HiCacheStorage):
             ctrl = config.ctrl
             device_id = _resolve_memcache_device_id(ctrl, storage_config)
             init_bm = bool(ctrl.get("init_bm", True))
+            stagger_seconds = float(
+                os.environ.get("SGLANG_NPU_MEMCACHE_INIT_STAGGER_SECONDS", "0")
+            )
+            if stagger_seconds > 0 and storage_config is not None:
+                delay = stagger_seconds * storage_config.tp_rank
+                logger.info("Staggering MemCache init by %.1f seconds", delay)
+                time.sleep(delay)
             if self.store.init(device_id, init_bm) != 0:
                 raise RuntimeError("memcache_hybrid.DistributedObjectStore.init failed")
             tp_rank = storage_config.tp_rank if storage_config is not None else 0
@@ -285,6 +294,11 @@ class NpuMemcacheStore(HiCacheStorage):
     def register_buffer(self, tensor: torch.Tensor):
         if self.store is None:
             raise RuntimeError("Ascend MemCache store is not initialized.")
+        if self._memcache_protocol == "device_rdma" and tensor.device.type == "cpu":
+            # H2G/G2H handles host buffers through the MemCache staging path.
+            # Direct RDMA MR registration of a pinned host allocation fails on A2.
+            logger.info("Skipping direct RDMA registration for CPU buffer")
+            return
         ptr = tensor.data_ptr()
         size = tensor.numel() * tensor.element_size()
         ret_code = self.store.register_buffer(ptr, size)
@@ -488,24 +502,15 @@ class NpuMemcacheStore(HiCacheStorage):
                     f"_{self.mha_suffix}_{name}_k",
                     f"_{self.mha_suffix}_{name}_v",
                 ]
-        elif name in (
-            PoolName.DRAFT_INDEXER,
-            PoolName.DEEPSEEK_V4_C1,
-            PoolName.DEEPSEEK_V4_C1_INDEXER,
-            PoolName.DEEPSEEK_V4_C1_INDEXER_SCALE,
-            PoolName.DEEPSEEK_V4_C2,
-            PoolName.DEEPSEEK_V4_C2_INDEXER,
-            PoolName.DEEPSEEK_V4_C2_INDEXER_SCALE,
-            PoolName.DEEPSEEK_V4_C4,
-            PoolName.DEEPSEEK_V4_C4_ROPE,
-            PoolName.DEEPSEEK_V4_C4_INDEXER,
-            PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE,
-            PoolName.DEEPSEEK_V4_C128,
-            PoolName.DEEPSEEK_V4_C128_ROPE,
-            PoolName.DEEPSEEK_V4_C4_STATE,
-            PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
-            PoolName.DEEPSEEK_V4_C128_STATE,
+        elif (
+            name == PoolName.DEEPSEEK_V4_C128
+            and host_pool.page_size != self.mem_pool_host.page_size
         ):
+            # NPU C128 is TP-sharded; a shared MLA key would mix rank payloads.
+            suffixes = [f"_{self.mha_suffix}_{name}"]
+        elif name == PoolName.DRAFT_INDEXER or name.value.startswith("deepseek_v4_"):
+            # V4 pools have one host buffer per logical page. Match their stable
+            # value prefix so older SGLang images need not define newer pool names.
             suffixes = [f"_{self.mla_suffix}_{name}"]
         elif name == PoolName.SWA:
             if not self.is_mla_backend and hasattr(host_pool, "v_buffer"):
@@ -533,11 +538,7 @@ class NpuMemcacheStore(HiCacheStorage):
         if logical_anchor and not pool_transfers:
             # 没有可校验的实体 pool 时，不得把逻辑锚点当成 L3 命中。
             return PoolTransferResult.empty()
-        kv_pages = (
-            len(keys)
-            if logical_anchor
-            else self.batch_exists(keys, extra_info)
-        )
+        kv_pages = len(keys) if logical_anchor else self.batch_exists(keys, extra_info)
 
         hit_count: dict = {PoolName.KV: kv_pages} if kv_pages else {}
         # 尾部窗口型 pool 可能只允许部分停止点，不能仅取各 pool 最大命中值。
@@ -546,6 +547,29 @@ class NpuMemcacheStore(HiCacheStorage):
         for transfer in pool_transfers or []:
             if not restorable:
                 break
+            if transfer.hit_policy == PoolHitPolicy.GROUPED_PAGES:
+                group_pages = transfer.group_pages
+                if group_pages <= 1:
+                    raise ValueError("GROUPED_PAGES requires group_pages > 1")
+                group_keys = keys[group_pages - 1 : kv_pages : group_pages]
+                component_keys, key_multiplier = self._get_hybrid_page_component_keys(
+                    group_keys, transfer
+                )
+                ex = self._batch_exist(self._tag_keys(component_keys))
+                boundary = 0
+                for i in range(len(group_keys)):
+                    if not all(
+                        r == 1
+                        for r in ex[i * key_multiplier : (i + 1) * key_multiplier]
+                    ):
+                        break
+                    boundary = (i + 1) * group_pages
+                if boundary:
+                    hit_count[transfer.name] = boundary
+                restorable = [
+                    p for p in restorable if p <= boundary and p % group_pages == 0
+                ]
+                continue
             component_keys, key_multiplier = self._get_hybrid_page_component_keys(
                 keys, transfer
             )
@@ -1019,9 +1043,7 @@ class NpuMemcacheStore(HiCacheStorage):
         self, key_strs: List[str], buffer_ptrs: List[Any], buffer_sizes: List[Any]
     ) -> List[int]:
         if buffer_ptrs and isinstance(buffer_ptrs[0], Sequence):
-            return self.store.batch_put_from_layers(
-                key_strs, buffer_ptrs, buffer_sizes
-            )
+            return self.store.batch_put_from_layers(key_strs, buffer_ptrs, buffer_sizes)
         return self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
 
     def _get_batch_zero_copy_impl(
@@ -1029,9 +1051,7 @@ class NpuMemcacheStore(HiCacheStorage):
     ) -> List[int]:
         multi_buffer = bool(buffer_ptrs) and isinstance(buffer_ptrs[0], Sequence)
         if multi_buffer:
-            raw = self.store.batch_get_into_layers(
-                key_strs, buffer_ptrs, buffer_sizes
-            )
+            raw = self.store.batch_get_into_layers(key_strs, buffer_ptrs, buffer_sizes)
         else:
             raw = self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
         out: List[int] = []

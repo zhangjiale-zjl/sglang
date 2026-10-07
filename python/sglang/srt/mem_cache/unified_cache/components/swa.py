@@ -1124,7 +1124,7 @@ class SWAComponent(TreeComponent):
 
         if phase == CacheTransferPhase.PREFETCH:
             # Staging is allocated once the hit is known; the placeholders carry
-            # the planned page count and _sync_trailing_keys fills the real hashes.
+            # the planned page count and _sync_sparse_keys fills the real hashes.
             num_pages = staging_tokens // self.tree_core.page_size
             if num_pages == 0:
                 return None

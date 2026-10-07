@@ -17,12 +17,14 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
     PoolName,
     PoolTransfer,
     PoolTransferResult,
 )
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentDeviceSlot,
+    FreeComponentHostSlot,
     SWARebuild,
 )
 from sglang.srt.mem_cache.unified_cache.components import (
@@ -31,6 +33,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     ComponentType,
     EvictLayer,
     PrepareLoadBackResult,
+    PreparePrefetchResult,
     TreeComponent,
 )
 
@@ -342,6 +345,18 @@ class C128SidecarComponent(TreeComponent):
             for page_ids in action.indices:
                 self.allocator.release_c128_pages(page_ids)
             return
+        if isinstance(action, FreeComponentHostSlot):
+            for host_indices in action.host_indices:
+                if host_indices is not None and host_indices.numel() > 0:
+                    self.cache.cache_controller.append_host_mem_release(
+                        extra_pools=[
+                            PoolTransfer(
+                                name=PoolName.DEEPSEEK_V4_C128,
+                                host_indices=host_indices,
+                            )
+                        ]
+                    )
+            return
         raise AssertionError(
             f"C128SidecarComponent: unhandled action {type(action).__name__}"
         )
@@ -389,6 +404,23 @@ class C128SidecarComponent(TreeComponent):
             self._c128_kv_pool_host.free(host_value)
 
     # ---- HiCache Hooks ----
+
+    def prepare_prefetch(
+        self, node_id: int, *, prefetch_tokens: int = 0
+    ) -> PreparePrefetchResult:
+        if self._c128_kv_pool_host is None:
+            return PreparePrefetchResult()
+        page_size = self.allocator.c128_attn_allocator.page_size
+        group_tokens = 128 * page_size
+        groups = prefetch_tokens // group_tokens
+        return PreparePrefetchResult(staging_tokens=groups * page_size)
+
+    def alloc_prefetch_staging(self, num_tokens: int) -> Optional[torch.Tensor]:
+        host_indices = self._c128_kv_pool_host.alloc(num_tokens)
+        if host_indices is None:
+            self.cache.evict_host(num_tokens * 128, BASE_COMPONENT_TYPE)
+            host_indices = self._c128_kv_pool_host.alloc(num_tokens)
+        return host_indices
 
     @staticmethod
     def _expand_page_indices(page_ids: torch.Tensor, page_size: int) -> torch.Tensor:
@@ -458,6 +490,32 @@ class C128SidecarComponent(TreeComponent):
                 )
             ]
 
+        if phase == CacheTransferPhase.BACKUP_STORAGE:
+            cd = node.component_data[ct]
+            if cd.host_value is None or not node.hash_value:
+                return None
+            # C128 pages are attached only at full compression-group endpoints.
+            return [
+                PoolTransfer(
+                    name=PoolName.DEEPSEEK_V4_C128,
+                    host_indices=cd.host_value,
+                    keys=[node.hash_value[-1]],
+                )
+            ]
+
+        if phase == CacheTransferPhase.PREFETCH:
+            groups = staging_tokens // page_size
+            if groups == 0:
+                return None
+            return [
+                PoolTransfer(
+                    name=PoolName.DEEPSEEK_V4_C128,
+                    keys=["__placeholder__"] * groups,
+                    hit_policy=PoolHitPolicy.GROUPED_PAGES,
+                    group_pages=128 * page_size // self.tree_core.page_size,
+                )
+            ]
+
         return None
 
     def commit_hicache_transfer(
@@ -507,4 +565,47 @@ class C128SidecarComponent(TreeComponent):
                 self.allocator.retain_c128_pages(page_ids)
                 self.tree_core.set_component_device_value(nid, ct, page_ids.clone())
                 offset += n_len
+            return
+
+        if phase == CacheTransferPhase.PREFETCH:
+            if not transfers or insert_result is None:
+                return
+            xfer = transfers[0]
+            host_indices = xfer.host_indices
+            if host_indices is None:
+                return
+            groups = len(host_indices) // page_size
+            loaded = (
+                pool_storage_result.extra_pool_hit_pages.get(
+                    PoolName.DEEPSEEK_V4_C128, 0
+                )
+                if pool_storage_result is not None
+                else 0
+            )
+            if insert_result.inserted_host_node is None or loaded < groups:
+                cache_actions.append(
+                    FreeComponentHostSlot([host_indices], component_type=ct)
+                )
+                return
+            tail = self.tree_core.node_by_id(insert_result.inserted_host_node)
+            group_tokens = 128 * page_size
+            start_depth = insert_result.total_len - groups * group_tokens
+            for i in range(groups):
+                boundary = start_depth + (i + 1) * group_tokens
+                boundary_node = self._ensure_boundary_node(
+                    tail, boundary, cache_actions
+                )
+                cd = boundary_node.component_data[ct]
+                page = host_indices[i * page_size : (i + 1) * page_size]
+                if cd.host_value is not None:
+                    cache_actions.append(
+                        FreeComponentHostSlot([page], component_type=ct)
+                    )
+                    continue
+                cd.host_value = page.clone()
+                if cd.value is None:
+                    host_lru = self.tree_core.host_lru_lists[ct]
+                    if not host_lru.in_list(boundary_node):
+                        host_lru.insert_mru(boundary_node)
+                self.tree_core._update_evictable_leaf_sets(boundary_node)
             return

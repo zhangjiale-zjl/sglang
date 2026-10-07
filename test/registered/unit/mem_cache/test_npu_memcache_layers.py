@@ -23,6 +23,7 @@ class TestNpuMemcacheLayers(CustomTestCase):
         self.backend.store = Mock()
         self.backend.is_mla_backend = True
         self.backend.mla_suffix = ""
+        self.backend.mha_suffix = "0"
         self.backend.extra_backend_tag = None
         self.backend.enable_storage_metrics = False
         self.backend.mem_pool_host = Mock()
@@ -89,16 +90,12 @@ class TestNpuMemcacheLayers(CustomTestCase):
 
     def test_flat_buffer_keeps_original_interface(self):
         self.backend.store.batch_get_into.return_value = [0, 3]
-        result = self.backend._get_batch_zero_copy_impl(
-            ["a", "b"], [11, 21], [4, 4]
-        )
+        result = self.backend._get_batch_zero_copy_impl(["a", "b"], [11, 21], [4, 4])
         self.assertEqual(result, [4, -3])
         self.backend.store.batch_get_into_layers.assert_not_called()
 
         self.backend.store.batch_put_from.return_value = [0]
-        self.assertEqual(
-            self.backend._put_batch_zero_copy_impl(["a"], [11], [4]), [0]
-        )
+        self.assertEqual(self.backend._put_batch_zero_copy_impl(["a"], [11], [4]), [0])
         self.backend.store.batch_put_from_layers.assert_not_called()
 
 
@@ -152,12 +149,38 @@ class TestNpuMemcacheDeepSeekV4(CustomTestCase):
             PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
         ):
             with self.subTest(pool=name):
-                self.backend.registered_pools[name] = Mock()
+                pool = Mock()
+                pool.page_size = self.backend.mem_pool_host.page_size
+                self.backend.registered_pools[name] = pool
                 keys, multiplier = self.backend._get_hybrid_page_component_keys(
                     ["page"], PoolTransfer(name=name)
                 )
                 self.assertEqual(keys, [f"page__{name}"])
                 self.assertEqual(multiplier, 1)
+
+    def test_npu_c128_uses_rank_specific_group_endpoint_keys(self):
+        self.backend.mem_pool_host.page_size = 128
+        self.backend.mha_suffix = "3"
+        c128_pool = Mock()
+        c128_pool.page_size = 16
+        self.backend.registered_pools[PoolName.DEEPSEEK_V4_C128] = c128_pool
+        transfer = PoolTransfer(
+            name=PoolName.DEEPSEEK_V4_C128,
+            keys=["__placeholder__", "__placeholder__"],
+            hit_policy=PoolHitPolicy.GROUPED_PAGES,
+            group_pages=16,
+        )
+        self.backend.store.batch_is_exist.side_effect = [[1] * 32, [1, 1]]
+
+        result = self.backend.batch_exists_v2(
+            [f"page{i}" for i in range(32)], [transfer]
+        )
+
+        self.assertEqual(result.kv_hit_pages, 32)
+        self.assertEqual(result.restorable_prefix_pages, [16, 32])
+        self.backend.store.batch_is_exist.assert_any_call(
+            ["page15_3_deepseek_v4_c128", "page31_3_deepseek_v4_c128"]
+        )
 
     def test_v4_keys_and_layered_get_set(self):
         pool = Mock()

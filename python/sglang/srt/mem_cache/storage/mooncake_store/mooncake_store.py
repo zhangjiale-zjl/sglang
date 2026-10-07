@@ -811,6 +811,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     f"_{self.mha_suffix}_{pool_name}_k",
                     f"_{self.mha_suffix}_{pool_name}_v",
                 ]
+        elif (
+            pool_name == PoolName.DEEPSEEK_V4_C128
+            and host_pool.page_size != self.mem_pool_host.page_size
+        ):
+            # NPU C128 is TP-sharded; a shared MLA key would mix rank payloads.
+            suffixes = [f"_{self.mha_suffix}_{pool_name}"]
         elif pool_name in (
             PoolName.INDEXER,
             PoolName.DRAFT_INDEXER,
@@ -877,6 +883,29 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         for transfer in pool_transfers or []:
             if not restorable:
                 break
+            if transfer.hit_policy == PoolHitPolicy.GROUPED_PAGES:
+                group_pages = transfer.group_pages
+                if group_pages <= 1:
+                    raise ValueError("GROUPED_PAGES requires group_pages > 1")
+                group_keys = keys[group_pages - 1 : kv_pages : group_pages]
+                component_keys, key_multiplier = self._get_hybrid_page_component_keys(
+                    group_keys, transfer
+                )
+                ex = self._batch_exist(self._tag_keys(component_keys), extra_info)
+                boundary = 0
+                for i in range(len(group_keys)):
+                    if not all(
+                        r == 1
+                        for r in ex[i * key_multiplier : (i + 1) * key_multiplier]
+                    ):
+                        break
+                    boundary = (i + 1) * group_pages
+                if boundary:
+                    hit_count[transfer.name] = boundary
+                restorable = [
+                    p for p in restorable if p <= boundary and p % group_pages == 0
+                ]
+                continue
             component_keys, key_multiplier = self._get_hybrid_page_component_keys(
                 keys, transfer
             )

@@ -561,6 +561,23 @@ class HiCacheController:
         from sglang.srt.mem_cache.storage import StorageBackendFactory
 
         try:
+            # Establish collective groups before MemCache opens NPU RDMA resources.
+            self.prefetch_hits_sync_groups = self._create_sync_groups()
+            self.prefetch_completion_sync_groups = self._create_sync_groups()
+            if (
+                storage_backend == "npu_memcache"
+                and self.storage_config.extra_config.get("protocol") == "device_rdma"
+            ):
+                # Model TP collectives can initialize lazily on the first forward.
+                # Bring up their HCCL/RA resources before MemCache claims RDMA.
+                from sglang.srt.distributed.parallel_state import get_tp_group
+
+                tp_device_group = get_tp_group().device_group
+                if torch.distributed.get_world_size(tp_device_group) > 1:
+                    probe = torch.zeros(1, device=self.device)
+                    torch.distributed.all_reduce(probe, group=tp_device_group)
+                    torch.npu.synchronize()
+
             self.storage_backend = StorageBackendFactory.create_backend(
                 storage_backend, self.storage_config, self.storage_host_pool
             )
@@ -581,11 +598,6 @@ class HiCacheController:
                 self.prefetch_capacity_limit = int(0.5 * self.mem_pool_host.size)
             # tracking the number of tokens locked in prefetching, updated by the main scheduler thread
             self.prefetch_tokens_occupied = 0
-
-            # Use dedicated gloo groups so storage prefetch sync is isolated
-            # from other collectives and consistent across CPxTP participants.
-            self.prefetch_hits_sync_groups = self._create_sync_groups()
-            self.prefetch_completion_sync_groups = self._create_sync_groups()
 
             # Select the get and set functions
             self.page_get_func = self._generic_page_get

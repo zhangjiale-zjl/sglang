@@ -55,6 +55,7 @@ class PPPrefetchPoolSpec:
     num_slots: int
     keys: Optional[List[str]] = None
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
+    group_pages: int = 1
     indices_from_pool: Optional[PoolName] = None
 
     @classmethod
@@ -69,6 +70,7 @@ class PPPrefetchPoolSpec:
             ),
             keys=list(transfer.keys) if transfer.keys is not None else None,
             hit_policy=transfer.hit_policy,
+            group_pages=transfer.group_pages,
             indices_from_pool=transfer.indices_from_pool,
         )
 
@@ -870,6 +872,7 @@ class HybridCacheController(BaseHiCacheController):
                     host_indices=indices,
                     keys=list(spec.keys) if spec.keys is not None else None,
                     hit_policy=spec.hit_policy,
+                    group_pages=spec.group_pages,
                     indices_from_pool=spec.indices_from_pool,
                 )
             )
@@ -978,6 +981,7 @@ class HybridCacheController(BaseHiCacheController):
                                     name=spec.name,
                                     keys=spec.keys,
                                     hit_policy=spec.hit_policy,
+                                    group_pages=spec.group_pages,
                                     indices_from_pool=spec.indices_from_pool,
                                 )
                                 for spec in ticket.pool_specs
@@ -1098,6 +1102,7 @@ class HybridCacheController(BaseHiCacheController):
                         device_indices=transfer_device_indices,
                         keys=transfer.keys,
                         hit_policy=transfer.hit_policy,
+                        group_pages=transfer.group_pages,
                         indices_from_pool=transfer.indices_from_pool,
                     )
                 )
@@ -1136,7 +1141,7 @@ class HybridCacheController(BaseHiCacheController):
                 if operation.sidecar_hash_values is not None
                 else kv_completed_pages
             )
-            self._sync_trailing_keys(transfers_nonkv, sidecar_hashes, sidecar_hit_pages)
+            self._sync_sparse_keys(transfers_nonkv, sidecar_hashes, sidecar_hit_pages)
             self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
             extra_info = HiCacheStorageExtraInfo(prefix_keys=operation.prefix_keys)
             results = self.storage_backend.batch_get_v2(
@@ -1222,6 +1227,12 @@ class HybridCacheController(BaseHiCacheController):
         if transfer.name == PoolName.MAMBA:
             return True
 
+        if transfer.name == PoolName.DEEPSEEK_V4_C128:
+            entry = self.mem_pool_host.entry_map.get(transfer.name)
+            if entry is not None and entry.host_pool.page_size != self.page_size:
+                # NPU C128 pages are TP-sharded and independently indexed.
+                return True
+
         # Mooncake gives MHA draft and draft-SWA objects rank-specific keys.
         # MLA/DeepSeek-V4 draft pools remain TP0-only.
         if self.storage_backend_type == "mooncake" and transfer.name in (
@@ -1283,25 +1294,29 @@ class HybridCacheController(BaseHiCacheController):
             else:
                 pass
 
-    def _sync_trailing_keys(
+    def _sync_sparse_keys(
         self,
         pool_transfers: list[PoolTransfer],
         all_hashes: list[str],
         kv_hit_pages: int,
     ) -> None:
-        """Re-align trailing-page sidecar keys after KV hit truncation.
+        """Align trailing and grouped sidecar keys after KV hit truncation.
 
-        When the storage hit is shorter than the original target prefix, each
-        pool transfer's keys must be updated to the last N hashes of the actual
-        hit range instead of the last N hashes of the original target range.
-        For mamba (N=1) this is just the last hit page hash; for SWA (N>1) it
-        is a sliding window of the last N hit pages.
+        Trailing pools use the last N hashes of the hit range. Grouped pools
+        use the hash at each complete group endpoint.
         """
         for transfer in pool_transfers:
-            if transfer.hit_policy != PoolHitPolicy.TRAILING_PAGES:
+            if transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
+                trailing_n = len(transfer.keys) if transfer.keys else 1
+                transfer.keys = all_hashes[
+                    max(0, kv_hit_pages - trailing_n) : kv_hit_pages
+                ]
+            elif transfer.hit_policy == PoolHitPolicy.GROUPED_PAGES:
+                group_pages = transfer.group_pages
+                assert group_pages > 1
+                transfer.keys = all_hashes[group_pages - 1 : kv_hit_pages : group_pages]
+            else:
                 continue
-            trailing_n = len(transfer.keys) if transfer.keys else 1
-            transfer.keys = all_hashes[max(0, kv_hit_pages - trailing_n) : kv_hit_pages]
             if transfer.host_indices is None:
                 continue
             entry = self.mem_pool_host.entry_map.get(transfer.name)
