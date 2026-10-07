@@ -707,6 +707,15 @@ class FusedMoE(torch.nn.Module):
     ):
         # for per channel weight quantization
         if shard_id == "w2":
+            # Multi-column ModelSlim compensation follows the TP reduction
+            # dimension; ordinary single-column scales remain replicated.
+            if (
+                expert_data.ndim == loaded_weight.ndim == 2
+                and loaded_weight.shape[-1] > 1
+                and loaded_weight.shape[-1] == expert_data.shape[-1] * self.moe_tp_size
+            ):
+                width = expert_data.shape[-1]
+                loaded_weight = loaded_weight.narrow(-1, tp_rank * width, width)
             loaded_weight = _maybe_copy_weight_view_before_h2d(loaded_weight)
             expert_data.copy_(loaded_weight)
         elif shard_id in ("w1", "w3"):

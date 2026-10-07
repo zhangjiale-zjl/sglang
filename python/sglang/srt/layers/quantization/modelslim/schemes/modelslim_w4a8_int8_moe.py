@@ -67,6 +67,8 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEScheme):
         )
 
         # Determine dimensions based on weight group
+        # Down-projection compensation is reduced across MoE TP ranks.
+        self.tp_size = int(layer.moe_tp_size)
         if self.weight_prefix == "w13":
             out_features = intermediate_size_per_partition
             in_features = hidden_size
