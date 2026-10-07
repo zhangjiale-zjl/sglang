@@ -11,6 +11,7 @@ from sgl_kernel_npu.fla.utils import prepare_chunk_indices
 from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend import (
     AscendMambaAttnBackendBase,
 )
+from sglang.srt.hardware_backend.npu.attention.gdn_prefill import run_gdn_prefill
 from sglang.srt.layers.attention.linear.gdn_backend import GDNKernelDispatcher
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
@@ -314,8 +315,19 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             ).contiguous()
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
 
-            core_attn_out, last_recurrent_state, h = self.chunk_gdn(
-                query, key, value, g, beta, ssm_states[cache_indices], query_start_loc
+            core_attn_out, last_recurrent_state, h = run_gdn_prefill(
+                self.chunk_gdn
+                if hasattr(torch.ops.npu, "chunk_gated_delta_rule")
+                else None,
+                self.kernel_dispatcher,
+                query,
+                key,
+                value,
+                g,
+                beta,
+                ssm_states,
+                cache_indices,
+                query_start_loc,
             )
 
             if last_recurrent_state is not None:
