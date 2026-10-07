@@ -1040,10 +1040,20 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self, node: UnifiedTreeNode, chunked: bool = False
     ) -> bool:
         """Increment hit count; check whether a write backup should be fired."""
-        if node.evicted or chunked:
+        if node.evicted:
             return False
         if self.is_write_back:
             return False
+        if chunked:
+            # Prefill chunks are not independent reuses, but eager write-through
+            # must persist them: a hybrid request can donate its last checkpoint
+            # before finishing and then have no terminal state to insert again.
+            return (
+                self.enable_hicache
+                and not self.enable_external_cache_linker
+                and self.write_through_threshold == 1
+                and not node.backuped
+            )
         node.hit_count += 1
 
         if self.enable_external_cache_linker:

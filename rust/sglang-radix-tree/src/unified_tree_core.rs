@@ -1405,11 +1405,19 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     /// Increment hit count; check whether a write backup should be fired.
     pub fn inc_hit_count_and_check_(&mut self, node_id: NodeIdx_, chunked: bool) -> bool {
         let node = self.arena.node_mut(node_id);
-        if node.evicted() || chunked {
+        if node.evicted() {
             return false;
         }
         if self.is_write_back {
             return false;
+        }
+        if chunked {
+            // A prefill chunk is not a reuse, but eager write-through still
+            // persists it when a hybrid request has no terminal checkpoint.
+            return self.enable_hicache
+                && !self.enable_external_cache_linker
+                && self.write_through_threshold == 1
+                && !node.backuped();
         }
         node.hit_count += 1;
 
